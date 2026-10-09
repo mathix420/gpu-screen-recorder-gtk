@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "capture_panel.hpp"
 extern "C" {
 #include "global_shortcuts.h"
 }
@@ -47,7 +48,7 @@ typedef struct {
     GtkWidget *streaming_page;
 } PageNavigationUserdata;
 
-static bool window_hidden = false;
+static bool window_hidden = true; // The settings window, the capture panel is shown on startup instead
 static GtkWidget *window;
 static SelectWindowUserdata select_window_userdata;
 static PageNavigationUserdata page_navigation_userdata;
@@ -170,6 +171,19 @@ static AppIndicator *app_indicator;
 static gsr_global_shortcuts global_shortcuts;
 static bool global_shortcuts_initialized = false;
 
+// Set while recording something that was selected in the capture panel
+struct PanelRecording {
+    bool active = false;
+    std::string capture_target; // The record area menu id this matches ("region", "portal", "window" or a monitor name)
+    std::string window_arg;     // gpu-screen-recorder -w value
+    std::string region_arg;     // gpu-screen-recorder -region value, if needed
+    bool restore_portal_session = true;
+};
+static PanelRecording panel_recording;
+static bool app_activated = false;
+static bool start_with_settings = false;
+static guint quit_timeout_id = 0;
+
 struct AudioInput {
     std::string name;
     std::string description;
@@ -245,6 +259,7 @@ struct SupportedCaptureOptions {
     bool window = false;
     bool focused = false;
     bool portal = false;
+    bool region = false;
     std::vector<GsrMonitor> monitors;
 };
 
@@ -428,22 +443,27 @@ static double clock_get_monotonic_seconds(void) {
 }
 
 static void show_window() {
-    gdk_window_show(gtk_widget_get_window(window));
-    gtk_menu_item_set_label(GTK_MENU_ITEM(show_hide_menu_item), "Hide window");
+    gtk_widget_show(window);
+    gtk_window_present(GTK_WINDOW(window));
+    gtk_menu_item_set_label(GTK_MENU_ITEM(show_hide_menu_item), "Hide settings");
     window_hidden = false;
 }
 
 static void hide_window() {
-    gdk_window_hide(gtk_widget_get_window(window));
-    gtk_menu_item_set_label(GTK_MENU_ITEM(show_hide_menu_item), "Show window");
+    gtk_widget_hide(window);
+    gtk_menu_item_set_label(GTK_MENU_ITEM(show_hide_menu_item), "Show settings");
     window_hidden = true;
 }
 
+static void open_settings();
+static void close_settings();
+static void quit_application();
+
 static void systray_show_hide_callback(GtkMenuItem*, gpointer) {
     if(window_hidden) {
-        show_window();
+        open_settings();
     } else {
-        hide_window();
+        close_settings();
     }
 }
 
@@ -471,7 +491,7 @@ static void start_stop_replay_systray_callback(GtkMenuItem*, gpointer userdata);
 static void save_replay_systray_callback(GtkMenuItem*, gpointer userdata);
 
 static void systray_exit_callback(GtkMenuItem*, gpointer) {
-    gtk_window_close(GTK_WINDOW(window));
+    quit_application();
 }
 
 enum class SystrayPage {
@@ -484,7 +504,7 @@ enum class SystrayPage {
 static GtkMenuShell* create_systray_menu(GtkApplication *app, SystrayPage systray_page) {
     GtkMenuShell *menu = GTK_MENU_SHELL(gtk_menu_new());
 
-    show_hide_menu_item = gtk_menu_item_new_with_label("Hide window");
+    show_hide_menu_item = gtk_menu_item_new_with_label(window_hidden ? "Show settings" : "Hide settings");
     g_signal_connect(show_hide_menu_item, "activate", G_CALLBACK(systray_show_hide_callback), app);
     gtk_menu_shell_append(menu, show_hide_menu_item);
 
@@ -997,6 +1017,13 @@ static void save_configs() {
     config.replay_config.container = gtk_combo_box_get_active_id(GTK_COMBO_BOX(replay_container));
     config.replay_config.replay_time = gtk_spin_button_get_value_as_int(replay_time_entry);
 
+    config.main_config.capture_panel_mode = capture_mode_to_string(capture_panel_get_mode());
+    const CaptureRect capture_panel_selection = capture_panel_get_selection();
+    char capture_panel_selection_str[128];
+    snprintf(capture_panel_selection_str, sizeof(capture_panel_selection_str), "%dx%d+%d+%d",
+        capture_panel_selection.width, capture_panel_selection.height, capture_panel_selection.x, capture_panel_selection.y);
+    config.main_config.capture_panel_selection = capture_panel_selection_str;
+
     if(gsr_info.system_info.display_server != DisplayServer::WAYLAND) {
         for(int i = 0; i < num_hotkeys; ++i) {
             // This can also happen if we run multiple instances of gpu screen recorder, in which case it will fail to grab keys for the other windows.
@@ -1088,6 +1115,18 @@ static Window window_get_target_window_child(Display *display, Window _window) {
     return found_window;
 }
 
+// Called once with the window that was clicked on (or None) after on_select_window_button_click
+static std::function<void(Window)> window_selected_callback;
+
+static void call_window_selected_callback(Window selected_window) {
+    if(!window_selected_callback)
+        return;
+
+    std::function<void(Window)> callback = std::move(window_selected_callback);
+    window_selected_callback = nullptr;
+    callback(selected_window);
+}
+
 static GdkFilterReturn filter_callback(GdkXEvent *xevent, GdkEvent*, gpointer userdata) {
     SelectWindowUserdata *_select_window_userdata = (SelectWindowUserdata*)userdata;
     XEvent *ev = (XEvent*)xevent;
@@ -1113,6 +1152,7 @@ static GdkFilterReturn filter_callback(GdkXEvent *xevent, GdkEvent*, gpointer us
         GdkScreen *screen = gdk_screen_get_default();
         GdkWindow *root_window = gdk_screen_get_root_window(screen);
         gdk_window_remove_filter(root_window, filter_callback, _select_window_userdata);
+        call_window_selected_callback(None);
         return GDK_FILTER_REMOVE;
     }
 
@@ -1143,6 +1183,7 @@ static GdkFilterReturn filter_callback(GdkXEvent *xevent, GdkEvent*, gpointer us
     gdk_window_remove_filter(root_window, filter_callback, _select_window_userdata);
 
     enable_stream_record_button_if_info_filled();
+    call_window_selected_callback(target_win);
 
     return GDK_FILTER_REMOVE;
 }
@@ -1450,7 +1491,7 @@ static bool show_pkexec_flatpak_error_if_needed() {
     if(!flatpak)
         return false;
 
-    const std::string window_str = record_area_selection_menu_get_active_id();
+    const std::string window_str = panel_recording.active ? panel_recording.capture_target : record_area_selection_menu_get_active_id();
     if(is_monitor_capture_drm() && window_str != "window" && window_str != "focused" && window_str != "portal") {
         if(!is_pkexec_installed()) {
             GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
@@ -2048,6 +2089,8 @@ static gboolean on_pause_unpause_button_click(GtkButton*, gpointer) {
     return true;
 }
 
+static void on_panel_recording_finished(bool saved);
+
 static gboolean on_start_recording_button_click(GtkButton *button, gpointer userdata) {
     GtkApplication *app = (GtkApplication*)userdata;
     const gchar *dir = gtk_button_get_label(record_file_chooser_button);
@@ -2089,6 +2132,11 @@ static gboolean on_start_recording_button_click(GtkButton *button, gpointer user
                 show_notification(app, "GPU Screen Recorder", notification_body.c_str(), G_NOTIFICATION_PRIORITY_NORMAL);
             }
         }
+
+        if(panel_recording.active) {
+            const bool saved = exit_status != 10 && exit_status != 50 && exit_status != 60 && exit_success && !(already_dead && exit_status != 0);
+            on_panel_recording_finished(saved);
+        }
         return true;
     }
 
@@ -2098,7 +2146,9 @@ static gboolean on_start_recording_button_click(GtkButton *button, gpointer user
 
     bool follow_focused = false;
     std::string window_str = record_area_selection_menu_get_active_id();
-    if(window_str == "window") {
+    if(panel_recording.active) {
+        window_str = panel_recording.window_arg;
+    } else if(window_str == "window") {
         if(select_window_userdata.selected_window == None) {
             fprintf(stderr, "No window selected!\n");
             return true;
@@ -2121,7 +2171,7 @@ static gboolean on_start_recording_button_click(GtkButton *button, gpointer user
     const gchar* framerate_mode_input_str = gtk_combo_box_get_active_id(GTK_COMBO_BOX(framerate_mode_input_menu));
     const bool exclude_metadata = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(exclude_metadata_button));
     const bool record_cursor = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(record_cursor_button));
-    const bool restore_portal_session = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(restore_portal_session_button));
+    const bool restore_portal_session = panel_recording.active ? panel_recording.restore_portal_session : gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(restore_portal_session_button));
     const std::string video_bitrate_str = std::to_string(gtk_spin_button_get_value_as_int(video_bitrate_entry));
 
     const int record_width = follow_focused ? gtk_spin_button_get_value_as_int(area_width_entry) : gtk_spin_button_get_value_as_int(video_width_entry);
@@ -2174,6 +2224,9 @@ static gboolean on_start_recording_button_click(GtkButton *button, gpointer user
 
     if(follow_focused || change_video_resolution)
         args.insert(args.end(), { "-s", area });
+
+    if(panel_recording.active && !panel_recording.region_arg.empty())
+        args.insert(args.end(), { "-region", panel_recording.region_arg.c_str() });
 
     args.push_back(NULL);
     debug_print_args(args.data());
@@ -2765,7 +2818,9 @@ static void parse_capture_options_line(GsrInfo *_gsr_info, const std::string &li
         _gsr_info->supported_capture_options.focused = true;
     else if(line == "portal")
         _gsr_info->supported_capture_options.portal = true;
-    else if(line != "region" && !line.empty() && line[0] != '/') // We dont support region capture in the gtk application
+    else if(line == "region") // Only used by the capture panel
+        _gsr_info->supported_capture_options.region = true;
+    else if(!line.empty() && line[0] != '/')
         _gsr_info->supported_capture_options.monitors.push_back(capture_option_line_to_monitor(line));
 }
 
@@ -4050,6 +4105,7 @@ static gboolean on_destroy_window(GtkWidget*, GdkEvent*, gpointer) {
             perror("waitpid failed");
             /* Ignore... */
         }
+        gpu_screen_recorder_process = -1;
     }
     save_configs();
     return true;
@@ -4100,6 +4156,7 @@ static void handle_record_timer() {
         char record_time_str[32];
         seconds_to_record_time_format(recording_time_passed_seconds, record_time_str, sizeof(record_time_str));
         gtk_label_set_text(GTK_LABEL(recording_record_time_label), record_time_str);
+        recording_indicator_set_text(record_time_str);
     }
 
     if(replaying) {
@@ -4441,7 +4498,255 @@ static bool gsr_startup_validation() {
     return true;
 }
 
+static void show_capture_panel() {
+    capture_panel_show(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(record_cursor_button)));
+}
+
+static void open_settings() {
+    capture_panel_hide();
+    show_window();
+}
+
+static void close_settings() {
+    hide_window();
+    if(!recording && !replaying && !streaming)
+        show_capture_panel();
+}
+
+static gboolean on_settings_window_delete(GtkWidget*, GdkEvent*, gpointer) {
+    // Closing the settings goes back to the capture panel instead of quitting
+    save_configs();
+    close_settings();
+    return true;
+}
+
+static void quit_application() {
+    if(quit_timeout_id) {
+        g_source_remove(quit_timeout_id);
+        quit_timeout_id = 0;
+    }
+
+    capture_panel_hide();
+    recording_indicator_hide();
+    // Stops gpu screen recorder and saves the config
+    on_destroy_window(window, nullptr, nullptr);
+    g_application_quit(G_APPLICATION(page_navigation_userdata.app));
+}
+
+static gboolean quit_application_timeout_handler(gpointer) {
+    quit_timeout_id = 0;
+    quit_application();
+    return G_SOURCE_REMOVE;
+}
+
+// Prefer showing the indicator on another monitor than the one being recorded so that it's not visible in the video
+static GdkMonitor* get_recording_indicator_monitor(GdkMonitor *recorded_monitor) {
+    GdkDisplay *display = gdk_display_get_default();
+    const int num_monitors = gdk_display_get_n_monitors(display);
+    for(int i = 0; i < num_monitors; ++i) {
+        GdkMonitor *monitor = gdk_display_get_monitor(display, i);
+        if(recorded_monitor && monitor != recorded_monitor)
+            return monitor;
+    }
+    return recorded_monitor;
+}
+
+static void on_panel_recording_finished(bool saved) {
+    panel_recording = PanelRecording{};
+    recording_indicator_hide();
+    on_streaming_recording_replay_page_back_click(nullptr, &page_navigation_userdata);
+
+    if(!window_hidden)
+        return;
+
+    if(saved) {
+        // Like the GNOME screenshot UI the application goes away once the recording is done. The delay gives the "recording saved" notification time to be sent
+        if(!quit_timeout_id)
+            quit_timeout_id = g_timeout_add(1000, quit_application_timeout_handler, nullptr);
+    } else {
+        // Recording failed or was cancelled (for example in the desktop portal), go back to the panel to try again
+        show_capture_panel();
+    }
+}
+
+static void start_panel_recording(GdkMonitor *indicator_monitor) {
+    GtkApplication *app = page_navigation_userdata.app;
+    panel_recording.active = true;
+
+    if(show_pkexec_flatpak_error_if_needed()) {
+        panel_recording = PanelRecording{};
+        show_capture_panel();
+        return;
+    }
+    show_bugged_driver_warning();
+
+    // Same as going to the recording page in the settings, so that the recording hotkeys and systray menu work while recording
+    gtk_stack_set_visible_child(page_navigation_userdata.stack, page_navigation_userdata.recording_page);
+    app_indicator_set_menu(app_indicator, GTK_MENU(create_systray_menu(app, SystrayPage::RECORDING)));
+    if(gsr_info.system_info.display_server != DisplayServer::WAYLAND)
+        replace_grabbed_keys_depending_on_active_page();
+
+    on_start_recording_button_click(start_recording_button, app);
+    if(!recording) {
+        panel_recording = PanelRecording{};
+        on_streaming_recording_replay_page_back_click(nullptr, &page_navigation_userdata);
+        show_capture_panel();
+        return;
+    }
+
+    recording_indicator_show(indicator_monitor, []() {
+        if(recording)
+            on_start_recording_button_click(start_recording_button, page_navigation_userdata.app);
+    });
+}
+
+// Monitor capture on Wayland and on AMD/Intel needs root access, which the flatpak can only get when it's installed system-wide
+static bool can_record_monitor_without_portal() {
+    if(!flatpak || !is_monitor_capture_drm())
+        return true;
+    return is_pkexec_installed() && flatpak_is_installed_as_system();
+}
+
+// Returns an empty string if the monitor should be recorded as a region instead
+static std::string get_gsr_monitor_name(GdkMonitor *monitor) {
+    const std::vector<GsrMonitor> &monitors = gsr_info.supported_capture_options.monitors;
+    if(monitors.size() == 1 && gdk_display_get_n_monitors(gdk_display_get_default()) == 1)
+        return monitors.front().name;
+
+    if(gsr_info.supported_capture_options.region || monitors.empty())
+        return "";
+
+    // Older versions of gpu screen recorder don't support region capture, match by resolution instead
+    GdkRectangle geometry;
+    gdk_monitor_get_geometry(monitor, &geometry);
+    const int scale = gdk_monitor_get_scale_factor(monitor);
+    for(const GsrMonitor &gsr_monitor : monitors) {
+        if(gsr_monitor.size.x == geometry.width * scale && gsr_monitor.size.y == geometry.height * scale)
+            return gsr_monitor.name;
+    }
+    return monitors.front().name;
+}
+
+static void on_capture_panel_record(CaptureMode mode, CaptureRect area, GdkMonitor *monitor) {
+    panel_recording = PanelRecording{};
+    panel_recording.restore_portal_session = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(restore_portal_session_button));
+
+    const bool wayland = gsr_info.system_info.display_server == DisplayServer::WAYLAND;
+    char region_str[128];
+
+    switch(mode) {
+        case CaptureMode::SELECTION: {
+            const CaptureRect region = capture_rect_to_display_server(area, monitor);
+            snprintf(region_str, sizeof(region_str), "%dx%d+%d+%d", region.width, region.height, region.x, region.y);
+            panel_recording.capture_target = "region";
+            panel_recording.window_arg = "region";
+            panel_recording.region_arg = region_str;
+            break;
+        }
+        case CaptureMode::SCREEN: {
+            const std::string monitor_name = get_gsr_monitor_name(monitor);
+            if(wayland && gsr_info.supported_capture_options.portal && !can_record_monitor_without_portal()) {
+                panel_recording.capture_target = "portal";
+                panel_recording.window_arg = "portal";
+            } else if(!monitor_name.empty()) {
+                panel_recording.capture_target = monitor_name;
+                panel_recording.window_arg = monitor_name;
+            } else {
+                const CaptureRect region = capture_rect_to_display_server(area, monitor);
+                snprintf(region_str, sizeof(region_str), "%dx%d+%d+%d", region.width, region.height, region.x, region.y);
+                panel_recording.capture_target = "region";
+                panel_recording.window_arg = "region";
+                panel_recording.region_arg = region_str;
+            }
+            break;
+        }
+        case CaptureMode::WINDOW: {
+            if(wayland) {
+                // Always let the user pick the window in the desktop portal instead of restoring the previous session
+                panel_recording.capture_target = "portal";
+                panel_recording.window_arg = "portal";
+                panel_recording.restore_portal_session = false;
+            } else {
+                window_selected_callback = [](Window selected_window) {
+                    if(selected_window == None || !validate_window(page_navigation_userdata.app, selected_window)) {
+                        show_capture_panel();
+                        return;
+                    }
+                    panel_recording.capture_target = "window";
+                    panel_recording.window_arg = std::to_string(selected_window);
+                    start_panel_recording(nullptr);
+                };
+                on_select_window_button_click(select_window_button, nullptr);
+                return;
+            }
+            break;
+        }
+    }
+
+    start_panel_recording(get_recording_indicator_monitor(monitor));
+}
+
+static void init_capture_panel() {
+    const bool wayland = gsr_info.system_info.display_server == DisplayServer::WAYLAND;
+    const bool allow_screen_capture = is_monitor_capture_drm() || nvfbc_installed;
+
+    CapturePanelOptions options;
+    options.selection_available = allow_screen_capture && gsr_info.supported_capture_options.region;
+    options.screen_available = (allow_screen_capture && !gsr_info.supported_capture_options.monitors.empty()) || (wayland && gsr_info.supported_capture_options.portal);
+    options.window_available = wayland ? gsr_info.supported_capture_options.portal : gsr_info.supported_capture_options.window;
+    options.window_hint = wayland ? "Press the record button to choose a window" : "Press the record button, then click on the window to record";
+
+    CapturePanelCallbacks callbacks;
+    callbacks.record = on_capture_panel_record;
+    callbacks.open_settings = open_settings;
+    callbacks.close = quit_application;
+    callbacks.show_pointer_changed = [](bool show_pointer) {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(record_cursor_button), show_pointer);
+        config.main_config.record_cursor = show_pointer;
+    };
+
+    CaptureMode mode = CaptureMode::SELECTION;
+    capture_mode_from_string(config.main_config.capture_panel_mode.c_str(), &mode);
+
+    CaptureRect selection;
+    if(sscanf(config.main_config.capture_panel_selection.c_str(), "%dx%d+%d+%d", &selection.width, &selection.height, &selection.x, &selection.y) != 4)
+        selection = CaptureRect{};
+
+    capture_panel_init(options, callbacks, mode, selection);
+}
+
+static void on_app_activated_again() {
+    if(quit_timeout_id) {
+        g_source_remove(quit_timeout_id);
+        quit_timeout_id = 0;
+    }
+
+    if(recording) {
+        // Launching the application again while recording stops the recording, so a single hotkey that launches the application can be used to start and stop recording
+        on_start_recording_button_click(start_recording_button, page_navigation_userdata.app);
+    } else if(window_selected_callback) {
+        // Waiting for the user to click on the window to record
+    } else if(replaying || streaming || !window_hidden) {
+        open_settings();
+    } else if(!capture_panel_is_visible()) {
+        show_capture_panel();
+    }
+}
+
+static void on_settings_action(GSimpleAction*, GVariant*, gpointer) {
+    if(app_activated)
+        open_settings();
+    else
+        start_with_settings = true;
+}
+
 static void activate(GtkApplication *app, gpointer) {
+    if(app_activated) {
+        on_app_activated_again();
+        return;
+    }
+    app_activated = true;
+
     if(!gsr_startup_validation()) {
         g_application_quit(G_APPLICATION(app));
         return;
@@ -4454,6 +4759,7 @@ static void activate(GtkApplication *app, gpointer) {
 
     window = gtk_application_window_new(app);
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy_window), nullptr);
+    g_signal_connect(window, "delete-event", G_CALLBACK(on_settings_window_delete), nullptr);
     gtk_window_set_title(GTK_WINDOW(window), window_title.c_str());
     gtk_window_set_resizable(GTK_WINDOW(window), false);
 
@@ -4528,8 +4834,15 @@ static void activate(GtkApplication *app, gpointer) {
 
     g_timeout_add(500, timer_timeout_handler, app);
 
-    gtk_widget_show_all(window);
+    // The settings window starts hidden, the capture panel is shown instead
+    gtk_widget_show_all(GTK_WIDGET(stack));
     load_config();
+
+    init_capture_panel();
+    if(start_with_settings)
+        open_settings();
+    else
+        show_capture_panel();
 
     if(gsr_info.system_info.display_server == DisplayServer::WAYLAND) {
         init_shortcuts_callback(false, nullptr);
@@ -4647,6 +4960,7 @@ int main(int argc, char **argv) {
 
     const bool use_old_ui_opt = argc >= 2 && strcmp(argv[1], "use-old-ui") == 0;
     const bool launched_by_daemon_opt = argc >= 2 && strcmp(argv[1], "gsr-ui") == 0;
+    const bool open_settings_opt = argc >= 2 && strcmp(argv[1], "settings") == 0;
     argc = 1;
 
     if(geteuid() == 0) {
@@ -4689,8 +5003,31 @@ int main(int argc, char **argv) {
     // This is needed for the correct window icon on wayland (app id needs to match the desktop file name).
     argv[0] = app_id;
 
-    GtkApplication *app = gtk_application_new(app_id, G_APPLICATION_NON_UNIQUE);
+    // Only one instance runs at a time. Launching the application again shows the capture panel or stops the recording, see on_app_activated_again
+    GtkApplication *app = gtk_application_new(app_id, G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
+
+    GSimpleAction *settings_action = g_simple_action_new("settings", nullptr);
+    g_signal_connect(settings_action, "activate", G_CALLBACK(on_settings_action), nullptr);
+    g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(settings_action));
+    g_object_unref(settings_action);
+
+    if(open_settings_opt) {
+        GError *error = nullptr;
+        if(g_application_register(G_APPLICATION(app), nullptr, &error) && g_application_get_is_remote(G_APPLICATION(app))) {
+            g_action_group_activate_action(G_ACTION_GROUP(app), "settings", nullptr);
+            GDBusConnection *session_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, nullptr);
+            if(session_bus) {
+                g_dbus_connection_flush_sync(session_bus, nullptr, nullptr);
+                g_object_unref(session_bus);
+            }
+            g_object_unref(app);
+            return 0;
+        }
+        g_clear_error(&error);
+        start_with_settings = true;
+    }
+
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
     return status;

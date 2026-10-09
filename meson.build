@@ -9,10 +9,21 @@ endif
 
 src = [
     'src/global_shortcuts.c',
+    'src/capture_panel.cpp',
     'src/main.cpp',
 ]
 
-dep = [
+dep = []
+
+# Used to show the capture panel overlay on Wayland compositors that support wlr-layer-shell (everything except GNOME).
+# gtk-layer-shell has to come before gtk (and libwayland-client) in the link order
+gtk_layer_shell_dep = dependency('gtk-layer-shell-0', version : '>=0.6.0', required : false)
+if gtk_layer_shell_dep.found()
+    dep += gtk_layer_shell_dep
+    add_project_arguments('-DGSR_LAYER_SHELL', language : ['c', 'cpp'])
+endif
+
+dep += [
     dependency('gtk+-3.0'),
     dependency('x11'),
     dependency('ayatana-appindicator3-0.1'),

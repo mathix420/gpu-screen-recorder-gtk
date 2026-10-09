@@ -49,6 +49,8 @@ struct MainConfig {
     bool use_new_ui = false;
     bool exclude_metadata = false;
     int32_t installed_gsr_global_hotkeys_version = 0;
+    std::string capture_panel_mode;
+    std::string capture_panel_selection; // WxH+X+Y, in gdk coordinates
 };
 
 struct YoutubeStreamConfig {
@@ -336,6 +338,8 @@ static std::map<std::string, ConfigValue> get_config_options(Config &config) {
         {"main.use_new_ui", {CONFIG_TYPE_BOOL, &config.main_config.use_new_ui}},
         {"main.exclude_metadata", {CONFIG_TYPE_BOOL, &config.main_config.exclude_metadata}},
         {"main.installed_gsr_global_hotkeys_version", {CONFIG_TYPE_I32, &config.main_config.installed_gsr_global_hotkeys_version}},
+        {"main.capture_panel_mode", {CONFIG_TYPE_STRING, &config.main_config.capture_panel_mode}},
+        {"main.capture_panel_selection", {CONFIG_TYPE_STRING, &config.main_config.capture_panel_selection}},
 
         {"streaming.service", {CONFIG_TYPE_STRING, &config.streaming_config.streaming_service}},
         {"streaming.youtube.key", {CONFIG_TYPE_STRING, &config.streaming_config.youtube.stream_key}},
