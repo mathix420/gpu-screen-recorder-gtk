@@ -881,7 +881,7 @@ static void trigger_record() {
         }
         case CaptureMode::SCREEN: {
             monitor = panel.selected_monitor;
-            if(!monitor)
+            if(!monitor || !display_has_monitor(gdk_display_get_default(), monitor))
                 return;
             GdkRectangle geometry;
             gdk_monitor_get_geometry(monitor, &geometry);
@@ -1295,6 +1295,10 @@ static void on_indicator_size_allocate(GtkWidget *window, GdkRectangle *allocati
     gtk_window_move(GTK_WINDOW(window), geometry.x + (geometry.width - allocation->width) / 2, geometry.y + 8);
 }
 
+static void unref_monitor(gpointer monitor, GClosure*) {
+    g_object_unref(monitor);
+}
+
 void recording_indicator_show(GdkMonitor *monitor, std::function<void()> stop_callback) {
     recording_indicator_hide();
     indicator.stop_callback = std::move(stop_callback);
@@ -1330,7 +1334,7 @@ void recording_indicator_show(GdkMonitor *monitor, std::function<void()> stop_ca
     if(!layer_shell) {
         gtk_window_set_keep_above(GTK_WINDOW(window), true);
         if(monitor)
-            g_signal_connect(window, "size-allocate", G_CALLBACK(on_indicator_size_allocate), monitor);
+            g_signal_connect_data(window, "size-allocate", G_CALLBACK(on_indicator_size_allocate), g_object_ref(monitor), unref_monitor, (GConnectFlags)0);
     }
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
